@@ -36,8 +36,6 @@
 #define system qsystem
 #endif
 
-// #define NO_QIP
-
 // contract_def.h needs to be included first to make sure that contracts have minimal access
 #include "contract_core/contract_def.h"
 #include "contract_core/contract_exec.h"
@@ -123,10 +121,10 @@ static volatile int shutDownNode = 0;
 #include "extensions/cxxopts.h"
 #include "extensions/overload.h"
 
+TickStorage::TransactionsDigestAccess TickStorage::transactionsDigestAccess;
 #ifdef _WIN32
 #undef system
 #define system qsystem
-TickStorage::TransactionsDigestAccess TickStorage::transactionsDigestAccess;
 #endif
 
 ////////// Qubic \\\\\\\\\\
@@ -187,8 +185,10 @@ static unsigned long long faultyComputorFlags[(NUMBER_OF_COMPUTORS + 63) / 64];
 static unsigned int gTickNumberOfComputors = 0, gTickTotalNumberOfComputors = 0, gFutureTickTotalNumberOfComputors = 0;
 static unsigned int nextTickTransactionsSemaphore = 0, numberOfNextTickTransactions = 0, numberOfKnownNextTickTransactions = 0;
 static unsigned short numberOfOwnComputorIndices;
-static unsigned short ownComputorIndices[sizeof(computorSeeds) / sizeof(computorSeeds[0])];
-static unsigned short ownComputorIndicesMapping[sizeof(computorSeeds) / sizeof(computorSeeds[0])];
+static std::vector<unsigned short> ownComputorIndices = {};
+// static unsigned short ownComputorIndices[sizeof(computorSeeds) / sizeof(computorSeeds[0])];
+static std::vector<unsigned short> ownComputorIndicesMapping = {};
+// static unsigned short ownComputorIndicesMapping[sizeof(computorSeeds) / sizeof(computorSeeds[0])];
 
 static TickStorage ts;
 static VoteCounter voteCounter;
@@ -303,6 +303,14 @@ static bool saveRevenueComponents(CHAR16* directory = NULL);
 #endif
 
 BroadcastFutureTickData broadcastedFutureTickData;
+
+static struct
+{
+    unsigned int tick;
+    unsigned int epoch;
+    unsigned int numberOfTxs;
+    m256i id;
+} latestCreatedTickInfo;
 
 #include "extensions/http.h"
 
@@ -729,7 +737,7 @@ static void processBroadcastMessage(const unsigned long long processorNumber, Re
             }
             else
             {
-                for (unsigned int i = 0; i < sizeof(computorSeeds) / sizeof(computorSeeds[0]); i++)
+                for (unsigned int i = 0; i < computorSeeds.size(); i++)
                 {
                     if (request->destinationPublicKey == computorPublicKeys[i])
                     {
@@ -875,7 +883,7 @@ static void processBroadcastComputors(Peer* peer, RequestResponseHeader* header)
                 {
                     minerPublicKeys[i] = request->computors.publicKeys[i];
 
-                    for (unsigned int j = 0; j < sizeof(computorSeeds) / sizeof(computorSeeds[0]); j++)
+                    for (unsigned int j = 0; j < computorSeeds.size(); j++)
                     {
                         if (request->computors.publicKeys[i] == computorPublicKeys[j])
                         {
@@ -1345,6 +1353,21 @@ static void processRequestEntity(Peer* peer, RequestResponseHeader* header)
 
 
     enqueueResponse(peer, sizeof(respondedEntity), RESPOND_ENTITY, header->dejavu(), &respondedEntity);
+}
+
+static void processRequestActiveIPOs(Peer* peer, RequestResponseHeader* header)
+{
+    RespondActiveIPO response;
+    for (unsigned int contractIndex = 1; contractIndex < contractCount; ++contractIndex)
+    {
+        if (system.epoch == contractDescriptions[contractIndex].constructionEpoch - 1) // IPO happens in the epoch before construction
+        {
+            response.contractIndex = contractIndex;
+            copyMem(response.assetName, contractDescriptions[contractIndex].assetName, 8);
+            enqueueResponse(peer, sizeof(RespondActiveIPO), RespondActiveIPO::type, header->dejavu(), &response);
+        }
+    }
+    enqueueResponse(peer, 0, EndResponse::type, header->dejavu(), NULL);
 }
 
 static void processRequestContractIPO(Peer* peer, RequestResponseHeader* header)
@@ -2176,6 +2199,12 @@ static void requestProcessor(void* ProcedureArgument, unsigned long long process
                 }
                 break;
 
+                case RequestActiveIPOs::type:
+                {
+                    processRequestActiveIPOs(peer, header);
+                }
+                break;
+
                 case RequestContractIPO::type:
                 {
                     processRequestContractIPO(peer, header);
@@ -2576,7 +2605,7 @@ static void processTickTransactionSolution(const MiningSolutionTransaction* tran
                     }
                 }
 
-                for (unsigned int i = 0; i < sizeof(computorSeeds) / sizeof(computorSeeds[0]); i++)
+                for (unsigned int i = 0; i < computorSeeds.size(); i++)
                 {
                     if (transaction->sourcePublicKey == computorPublicKeys[i])
                     {
@@ -2728,7 +2757,7 @@ static void processTickTransactionSolution(const MiningSolutionTransaction* tran
     }
     else
     {
-        for (unsigned int i = 0; i < sizeof(computorSeeds) / sizeof(computorSeeds[0]); i++)
+        for (unsigned int i = 0; i < computorSeeds.size(); i++)
         {
             if (transaction->sourcePublicKey == computorPublicKeys[i])
             {
@@ -3249,7 +3278,7 @@ static void processTick(unsigned long long processorNumber)
 
     getUniverseDigest(etalonTick.saltedUniverseDigest);
 
-    if (isSystemAtSecurityTick() || isNextTickIsSecurityTick() || isLastTickInEpoch() || isThereQearnTx)
+    if (isMainMode() || isSystemAtSecurityTick() || isNextTickIsSecurityTick() || isLastTickInEpoch() || isThereQearnTx)
     {
         getComputerDigest(etalonTick.saltedComputerDigest);
     }
@@ -3387,6 +3416,11 @@ static void processTick(unsigned long long processorNumber)
                         }
                     }
 
+                    latestCreatedTickInfo.epoch = system.epoch;
+                    latestCreatedTickInfo.tick = system.tick + TICK_TRANSACTIONS_PUBLICATION_OFFSET;
+                    latestCreatedTickInfo.numberOfTxs = nextTxIndex;
+                    latestCreatedTickInfo.id = computorPublicKeys[ownComputorIndicesMapping[i]];
+
                     for (; nextTxIndex < NUMBER_OF_TRANSACTIONS_PER_TICK; ++nextTxIndex)
                     {
                         broadcastedFutureTickData.tickData.transactionDigests[nextTxIndex] = m256i::zero();
@@ -3413,7 +3447,7 @@ static void processTick(unsigned long long processorNumber)
     {
         // Publish solutions that were sent via BroadcastMessage as MiningSolutionTransaction
         PROFILE_NAMED_SCOPE("processTick(): broadcast solutions as tx (from BroadcastMessage)");
-        for (unsigned int i = 0; i < sizeof(computorSeeds) / sizeof(computorSeeds[0]); i++)
+        for (unsigned int i = 0; i < computorSeeds.size(); i++)
         {
             int solutionIndexToPublish = -1;
 
@@ -3560,7 +3594,7 @@ static void beginEpoch()
     {
         minerPublicKeys[i] = broadcastedComputors.computors.publicKeys[i];
 
-        for (unsigned int j = 0; j < sizeof(computorSeeds) / sizeof(computorSeeds[0]); j++)
+        for (unsigned int j = 0; j < computorSeeds.size(); j++)
         {
             if (broadcastedComputors.computors.publicKeys[i] == computorPublicKeys[j])
             {
@@ -4158,7 +4192,7 @@ static bool loadAllNodeStates()
     numberOfOwnComputorIndices = 0;
     for (unsigned int i = 0; i < NUMBER_OF_COMPUTORS; i++)
     {
-        for (unsigned int j = 0; j < sizeof(computorSeeds) / sizeof(computorSeeds[0]); j++)
+        for (unsigned int j = 0; j < computorSeeds.size(); j++)
         {
             if (broadcastedComputors.computors.publicKeys[i] == computorPublicKeys[j])
             {
@@ -5598,6 +5632,16 @@ static void tickProcessor(void*, unsigned long long processorNumber)
                                     appendText(message, (mainAuxStatus & 2) ? L"MAIN" : L"aux");
                                     logToConsole(message);
                                 }
+
+                                // Flip forceDontUseSecurityTick flag based on stack
+                                while (!forceDontUseSecurityTickChangeStack.empty())
+                                {
+                                    forceDontUseSecurityTickChangeStack.pop_back();
+                                    forceDontUseSecurityTick = !forceDontUseSecurityTick;
+                                    setText(message, L"forceDontUseSecurityTick is now ");;
+                                    appendText(message, forceDontUseSecurityTick ? L"ON" : L"OFF");
+                                    logToConsole(message);
+                                }
                             }
                         }
                     }
@@ -5784,6 +5828,7 @@ static bool initialize()
     setMem(processors, sizeof(processors), 0);
     setMem(peers, sizeof(peers), 0);
     setMem(publicPeers, sizeof(publicPeers), 0);
+    setMem(&latestCreatedTickInfo, sizeof(latestCreatedTickInfo), 0);
 
     requestedComputors.header.setSize<sizeof(requestedComputors)>();
     requestedComputors.header.setType(RequestComputors::type);
@@ -5794,6 +5839,9 @@ static bool initialize()
     requestedTickTransactions.header.setSize<sizeof(requestedTickTransactions)>();
     requestedTickTransactions.header.setType(REQUEST_TICK_TRANSACTIONS);
     requestedTickTransactions.requestedTickTransactions.tick = 0;
+
+    ownComputorIndices.resize(computorSeeds.size());
+    ownComputorIndicesMapping.resize(computorSeeds.size());
 
     if (!initFilesystem())
         return false;
@@ -6695,9 +6743,10 @@ static void processKeyPresses()
             forceDontCheckComputerDigest = true;
             break;
         case 's':
-            forceDontUseSecurityTick = !forceDontUseSecurityTick;
-            setText(message, L"forceDontUseSecurityTick is now ");;
-            appendText(message, forceDontUseSecurityTick ? L"ON" : L"OFF");
+            forceDontUseSecurityTickChangeStack.push_back(1);
+            // forceDontUseSecurityTick = !forceDontUseSecurityTick;
+            // setText(message, L"forceDontUseSecurityTick is now ");;
+            // appendText(message, forceDontUseSecurityTick ? L"ON" : L"OFF");
             logToConsole(message);
             break;
         }
@@ -7034,23 +7083,28 @@ static void processKeyPresses()
             }
             else
             {
-                // mainAuxStatus = (mainAuxStatus + 1) & 3;
-                // setText(message, (isMainMode()) ? L"MAIN" : L"aux");
-                // appendText(message, L"&");
-                // appendText(message, (mainAuxStatus & 2) ? L"MAIN" : L"aux");
-                // logToConsole(message);
-                mainAuxStatusChangeStack.push_back(1);
-                // Predicted print the status
-                unsigned char predictedStatus = mainAuxStatus;
-                for (int i = 0; i < mainAuxStatusChangeStack.size(); i++)
-                {
-                    predictedStatus = (predictedStatus + 1) & 3;
-                }
-                setText(message, L"Predicted mode after applying all changes in stack: ");
-                appendText(message, (predictedStatus & 1) ? L"MAIN" : L"aux");
-                appendText(message, L"&");
-                appendText(message, (predictedStatus & 2) ? L"MAIN" : L"aux");
-                logToConsole(message);
+               if (isTestnet())
+               {
+                   mainAuxStatus = (mainAuxStatus + 1) & 3;
+                   setText(message, (isMainMode()) ? L"MAIN" : L"aux");
+                   appendText(message, L"&");
+                   appendText(message, (mainAuxStatus & 2) ? L"MAIN" : L"aux");
+                   logToConsole(message);
+               } else
+               {
+                   mainAuxStatusChangeStack.push_back(1);
+                   // Predicted print the status
+                   unsigned char predictedStatus = mainAuxStatus;
+                   for (int i = 0; i < mainAuxStatusChangeStack.size(); i++)
+                   {
+                       predictedStatus = (predictedStatus + 1) & 3;
+                   }
+                   setText(message, L"Predicted mode after applying all changes in stack: ");
+                   appendText(message, (predictedStatus & 1) ? L"MAIN" : L"aux");
+                   appendText(message, L"&");
+                   appendText(message, (predictedStatus & 2) ? L"MAIN" : L"aux");
+                   logToConsole(message);
+               }
             }
         }
         break;
@@ -7823,6 +7877,8 @@ void processArgs(int argc, const char* argv[]) {
         ("t,threads", "Total Threads will be used by the core", cxxopts::value<int>())
         ("d,ticking-delay", "Delay ticking process by milliseconds", cxxopts::value<int>())
         ("l,solution-threads", "Threads that will be used by the core to process solution", cxxopts::value<int>())
+        ("sm, node-mode", "Set start mode to Main&aux,....", cxxopts::value<int>())
+        ("seeds", "Set seeds (IDs) to run on this node (only apply for main node)", cxxopts::value<std::string>())
         ("rp, reader-passcode", "Passcode to access log reader", cxxopts::value<std::string>())
         ("hp, http-passcode", "Passcode to access http server", cxxopts::value<std::string>())
         ("s,security-tick", "Core will verify state after x tick, to reduce computational to the node", cxxopts::value<int>()->default_value("1"));
@@ -7871,6 +7927,44 @@ void processArgs(int argc, const char* argv[]) {
     if (result.count("rebuild-tx-hashmap"))
     {
         rebuildTxHashmap = true;
+    }
+
+    if (result.count("node-mode"))
+    {
+        int mode = result["node-mode"].as<int>();
+        mainAuxStatus = mode;
+        std::string modeString = (isMainMode() ? "MAIN" : "aux") + std::string("&") + ((mainAuxStatus & 2) ? "MAIN" : "aux") + std::string(" mode enabled.");
+        logColorToScreen("INFO", modeString);
+    }
+
+    // expected format seed1,seed2 where seed1,seed2 is string of 55 lowercase alphabet character
+    if (result.count("seeds")) {
+        std::string seedsStr = result["seeds"].as<std::string>();
+        std::stringstream ss(seedsStr);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            if (token.length() != 55) {
+                logColorToScreen("ERROR", "Invalid seed length: " + token);
+                exit(1);
+            }
+
+            // Check if it already exists
+            bool exists = false;
+            for (const auto& existingSeed : computorSeeds) {
+                if (existingSeed == token) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (exists) {
+                logColorToScreen("WARN", "Duplicate seed found, skipping: " + token);
+                continue;
+            }
+            computorSeeds.push_back(token);
+        }
+
+        // Print seeds for verification
+        logColorToScreen("INFO", "Operating with " + std::to_string(computorSeeds.size()) + " computor seeds.");
     }
 
     if (result.count("reader-passcode")) {
